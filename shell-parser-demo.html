@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simplified shell parser demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #333;
+        }
+        textarea {
+            width: 100%;
+            height: 100px;
+            margin-bottom: 10px;
+        }
+        button {
+            padding: 10px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 10px;
+            overflow-x: auto;
+        }
+        .error {
+            color: red;
+        }
+    </style>
+</head>
+<body>
+    <h1>Simplified shell parser demo</h1>
+
+    <pre>
+            ...parses roughly according to stash's "Shell Grammar Simplified"
+             ( https://github.com/ywangd/stash/blob/master/man/grammar.txt )
+        -----------------------------------------------------------------------------
+        complete_command : pipe_sequence (punctuator pipe_sequence)* [punctuator]
+        punctuator       : ';' | '&'
+        pipe_sequence    : simple_command ('|' simple_command)*
+        simple_command   : cmd_prefix [cmd_word] [cmd_suffix]
+                         | cmd_word [cmd_suffix]
+        cmd_prefix       : assignment_word+
+        cmd_suffix       : word + [io_redirect]
+                         | io_redirect
+        io_redirect      : ('>' | '>>') filename
+        modifier         : '!' | '\'
+        cmd_word         : [modifier] word
+        filename         : word
+        word             : escaped | uq_word | bq_word | dq_word | sq_word
+        uq_word          : (WORD_CHARS)+ | '&3'        
+    </pre>
+    
+    <textarea id="input" placeholder="Enter your shell command here..."></textarea>
+    <button onclick="parseInput()">Parse Command</button>
+
+
+    <h2>Parsed Result:</h2>
+    <pre id="output"></pre>
+
+    <h2>Test Cases:</h2>
+    <div id="testCases"></div>
+
+    <script>
+        // Token types
+        const TokenType = {
+            WORD: 'WORD',
+            PIPE: 'PIPE',
+            SEMICOLON: 'SEMICOLON',
+            AMPERSAND: 'AMPERSAND',
+            REDIRECT_OUT: 'REDIRECT_OUT',
+            REDIRECT_APPEND: 'REDIRECT_APPEND',
+            MODIFIER: 'MODIFIER',
+            EOF: 'EOF'
+        };
+
+        class Token {
+            constructor(type, value) {
+                this.type = type;
+                this.value = value;
+            }
+        }
+
+        class Lexer {
+            constructor(input) {
+                this.input = input;
+                this.position = 0;
+            }
+
+            getNextToken() {
+                while (this.position < this.input.length && /\s/.test(this.input[this.position])) {
+                    this.position++;
+                }
+
+                if (this.position >= this.input.length) {
+                    return new Token(TokenType.EOF, "");
+                }
+
+                const currentChar = this.input[this.position];
+
+                if (currentChar === '|') {
+                    this.position++;
+                    return new Token(TokenType.PIPE, '|');
+                } else if (currentChar === ';') {
+                    this.position++;
+                    return new Token(TokenType.SEMICOLON, ';');
+                } else if (currentChar === '&') {
+                    this.position++;
+                    return new Token(TokenType.AMPERSAND, '&');
+                } else if (currentChar === '>') {
+                    if (this.input[this.position + 1] === '>') {
+                        this.position += 2;
+                        return new Token(TokenType.REDIRECT_APPEND, '>>');
+                    } else {
+                        this.position++;
+                        return new Token(TokenType.REDIRECT_OUT, '>');
+                    }
+                } else if (currentChar === '!' || currentChar === '\\') {
+                    this.position++;
+                    return new Token(TokenType.MODIFIER, currentChar);
+                } else {
+                    return this.readWord();
+                }
+            }
+
+            readWord() {
+                let word = '';
+                while (this.position < this.input.length) {
+                    const char = this.input[this.position];
+                    if (!/\s/.test(char) && !'|;&>'.includes(char)) {
+                        word += char;
+                        this.position++;
+                    } else {
+                        break;
+                    }
+                }
+                return new Token(TokenType.WORD, word);
+            }
+        }
+
+        class Parser {
+            constructor(lexer) {
+                this.lexer = lexer;
+                this.currentToken = this.lexer.getNextToken();
+            }
+
+            eat(tokenType) {
+                if (this.currentToken.type === tokenType) {
+                    this.currentToken = this.lexer.getNextToken();
+                } else {
+                    throw new Error(`Unexpected token: ${this.currentToken.type}, expected: ${tokenType}`);
+                }
+            }
+
+            parseCompleteCommand() {
+                const commands = [this.parsePipeSequence()];
+                while (this.currentToken.type === TokenType.SEMICOLON || this.currentToken.type === TokenType.AMPERSAND) {
+                    const punctuator = this.currentToken.value;
+                    this.eat(this.currentToken.type);
+                    if (this.currentToken.type !== TokenType.EOF) {
+                        commands.push(this.parsePipeSequence());
+                    }
+                    // we tie the punctuator to the previous command
+                    commands[commands.length - 2].punctuator = punctuator;
+                }
+                return { type: 'complete_command', commands };
+            }
+
+            parsePipeSequence() {
+                const commands = [this.parseSimpleCommand()];
+                while (this.currentToken.type === TokenType.PIPE) {
+                    this.eat(TokenType.PIPE);
+                    commands.push(this.parseSimpleCommand());
+                }
+                return { type: 'pipe_sequence', commands };
+            }
+
+            parseSimpleCommand() {
+                let prefix = null;
+                let word = null;
+                let suffix = null;
+
+                if (this.currentToken.type === TokenType.WORD) {
+                    const nextToken = this.lexer.getNextToken();
+                    this.lexer.position -= nextToken.value.length;
+                    if (nextToken.type === TokenType.WORD && this.currentToken.value.includes('=')) {
+                        prefix = this.parseCmdPrefix();
+                    }
+                }
+
+                if (this.currentToken.type === TokenType.MODIFIER || this.currentToken.type === TokenType.WORD) {
+                    word = this.parseCmdWord();
+                }
+
+                if (this.currentToken.type === TokenType.WORD || 
+                    this.currentToken.type === TokenType.REDIRECT_OUT || 
+                    this.currentToken.type === TokenType.REDIRECT_APPEND) {
+                    suffix = this.parseCmdSuffix();
+                }
+
+                return { type: 'simple_command', prefix, word, suffix };
+            }
+
+            parseCmdPrefix() {
+                const assignments = [];
+                debugger;
+                while (this.currentToken.type === TokenType.WORD && this.currentToken.value.includes('=')) {
+                    assignments.push(this.currentToken.value);
+                    this.eat(TokenType.WORD);
+                }
+                return assignments.length > 0 ? { type: 'cmd_prefix', assignments } : null;
+            }
+
+            parseCmdWord() {
+                let modifier = null;
+                if (this.currentToken.type === TokenType.MODIFIER) {
+                    modifier = this.currentToken.value;
+                    this.eat(TokenType.MODIFIER);
+                }
+                const word = this.currentToken.value;
+                this.eat(TokenType.WORD);
+                return { type: 'cmd_word', modifier, word };
+            }
+
+            parseCmdSuffix() {
+                const words = [];
+                let redirect = null;
+
+                while (this.currentToken.type === TokenType.WORD) {
+                    words.push(this.currentToken.value);
+                    this.eat(TokenType.WORD);
+                }
+
+                if (this.currentToken.type === TokenType.REDIRECT_OUT || this.currentToken.type === TokenType.REDIRECT_APPEND) {
+                    redirect = this.parseIoRedirect();
+                }
+
+                return words.length > 0 || redirect ? { type: 'cmd_suffix', words, redirect } : null;
+            }
+
+            parseIoRedirect() {
+                const operator = this.currentToken.value;
+                this.eat(this.currentToken.type);
+                const filename = this.currentToken.value;
+                this.eat(TokenType.WORD);
+                return { type: 'io_redirect', operator, filename };
+            }
+
+            parse() {
+                return this.parseCompleteCommand();
+            }
+        }
+
+        function parseShellCommand(input) {
+            const lexer = new Lexer(input);
+            const parser = new Parser(lexer);
+            return parser.parse();
+        }
+
+        function parseInput() {
+            const input = document.getElementById('input').value;
+            const output = document.getElementById('output');
+            try {
+                const result = parseShellCommand(input);
+                output.textContent = JSON.stringify(result, null, 2);
+            } catch (error) {
+                output.innerHTML = `<span class="error">Error: ${error.message}</span>`;
+                console.error(error);
+            }
+        }
+
+        // Test cases
+        const testCases = [
+            {
+                input: "!previous_command",
+                description: "Negate the previous command",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                        type: "pipe_sequence",
+                        commands: [
+                            {
+                            type: "simple_command",
+                            prefix: null,
+                            word: {
+                                type: "cmd_word",
+                                modifier: "!",
+                                word: "previous_command"
+                            },
+                            suffix: null
+                            }
+                        ]
+                        }
+                    ]
+                }
+            },
+            {
+                input: "echo Hello World",
+                description: "a simple command that would print \"Hello world\" to the console",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "echo" },
+                                    suffix: { type: "cmd_suffix", words: ["Hello", "World"], redirect: null }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            {
+                input: "ls -l | grep .js | wc -l",
+                description: "a command that lists all files in the current directory, filters out files with .js extension, and counts the number of lines",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "ls" },
+                                    suffix: { type: "cmd_suffix", words: ["-l"], redirect: null }
+                                },
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "grep" },
+                                    suffix: { type: "cmd_suffix", words: [".js"], redirect: null }
+                                },
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "wc" },
+                                    suffix: { type: "cmd_suffix", words: ["-l"], redirect: null }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            {
+                input: "echo Hello > output.txt",
+                description: "a command that writes \"Hello\" to a file named output.txt",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "echo" },
+                                    suffix: {
+                                        type: "cmd_suffix",
+                                        words: ["Hello"],
+                                        redirect: { type: "io_redirect", operator: ">", filename: "output.txt" }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            {
+                input: "command1 | command2 >> output.txt",
+                description: "a command that pipes the output of command1 to command2 and appends the output to a file named output.txt",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                        type: "pipe_sequence",
+                        commands: [
+                            {
+                            type: "simple_command",
+                            prefix: null,
+                            word: {
+                                type: "cmd_word",
+                                modifier: null,
+                                word: "command1"
+                            },
+                            suffix: null
+                            },
+                            {
+                            type: "simple_command",
+                            prefix: null,
+                            word: {
+                                type: "cmd_word",
+                                modifier: null,
+                                word: "command2"
+                            },
+                            suffix: {
+                                type: "cmd_suffix",
+                                words: [],
+                                redirect: {
+                                type: "io_redirect",
+                                operator: ">>",
+                                filename: "output.txt"
+                                }
+                            }
+                            }
+                        ]
+                        }
+                    ]
+                }
+
+            },
+            {
+                input: "VAR=value echo $VAR",
+                description: "a command that sets an environment variable VAR to value and prints the value of VAR",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                        type: "pipe_sequence",
+                        commands: [
+                            {
+                            type: "simple_command",
+                            prefix: {
+                                type: "cmd_prefix",
+                                assignments: [
+                                    "VAR=value"
+                                ]
+                            },
+                            word: {
+                                type: "cmd_word",
+                                modifier: null,
+                                word: "echo"
+                            },
+                            suffix: {
+                                type: "cmd_suffix",
+                                words: [
+                                "$VAR"
+                                ],
+                                redirect: null
+                            }
+                            }
+                        ]
+                        }
+                    ]
+                    }
+            },
+            {
+                input: "VAR=value command arg1 arg2",
+                description: "a command that sets an environment variable VAR to value and runs a command with arguments",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: { type: "cmd_prefix", assignments: ["VAR=value"] },
+                                    word: { type: "cmd_word", modifier: null, word: "command" },
+                                    suffix: { type: "cmd_suffix", words: ["arg1", "arg2"], redirect: null }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            {
+                input: "command1 ; command2 & command3",
+                description: "a command that runs command1, then command2 in the background, and finally command3",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "command1" },
+                                    suffix: null
+                                }
+                            ],
+                            punctuator: ";"
+                        },
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "command2" },
+                                    suffix: null
+                                }
+                            ],
+                            punctuator: "&"
+                        },
+                        {
+                            type: "pipe_sequence",
+                            commands: [
+                                {
+                                    type: "simple_command",
+                                    prefix: null,
+                                    word: { type: "cmd_word", modifier: null, word: "command3" },
+                                    suffix: null
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            {
+                input: "\\rm -rf /path/to/directory",
+                description: "a command that runs the rm command with -rf flag on a directory",
+                expected: {
+                    type: "complete_command",
+                    commands: [
+                        {
+                        type: "pipe_sequence",
+                        commands: [
+                            {
+                            type: "simple_command",
+                            prefix: null,
+                            word: {
+                                type: "cmd_word",
+                                modifier: "\\",
+                                word: "rm"
+                            },
+                            suffix: {
+                                type: "cmd_suffix",
+                                words: [
+                                "-rf",
+                                "/path/to/directory"
+                                ],
+                                redirect: null
+                            }
+                            }
+                        ]
+                        }
+                    ]
+                }
+            }
+        ];
+
+        // Run tests and display results
+        function runTests() {
+            const testCasesDiv = document.getElementById('testCases');
+            testCasesDiv.innerHTML = '';
+
+            testCases.forEach((testCase, index) => {
+                let result, error;
+                try {
+                    result = parseShellCommand(testCase.input);
+                } catch (e) {
+                    error = e;
+                }
+
+                const passed = !error && JSON.stringify(result) === JSON.stringify(testCase.expected);
+
+                const testCaseElement = document.createElement('div');
+                testCaseElement.innerHTML = `
+                    <h3>Test Case ${index + 1}:</h3>
+                    <p><strong>Input:</strong> ${testCase.input}</p>
+                    <p><strong>Description:</strong> ${testCase.description}</p>
+                    <p><strong>Result:</strong></p>
+                    <pre>${error ? `<span class="error">Error: ${error.message} stack: ${error.stack} </span>` : JSON.stringify(result, null, 2)}</pre>
+                    <p><strong>Expected:</strong></p>
+                    <pre>${JSON.stringify(testCase.expected, null, 2)}</pre>
+                    <p><strong>Passed:</strong> ${passed ? 'Yes' : 'No'}</p>
+                    <hr>
+                `;
+                testCasesDiv.appendChild(testCaseElement);
+            });
+        }
+
+        // Run tests when the page loads
+        window.onload = runTests;
+    </script>
+</body>
+</html>
