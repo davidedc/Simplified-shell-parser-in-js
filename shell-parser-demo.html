@@ -285,7 +285,7 @@
         const testCases = [
             {
                 input: "!previous_command",
-                description: "Negate the previous command",
+                description: "Runs the previous command in the shell history.",
                 expected: {
                     type: "complete_command",
                     commands: [
@@ -329,7 +329,7 @@
             },
             {
                 input: "ls -l | grep .js | wc -l",
-                description: "a command that lists all files in the current directory, filters out files with .js extension, and counts the number of lines",
+                description: "a command that lists all files in the current directory, filters for files with .js extension, and counts the number of lines",
                 expected: {
                     type: "complete_command",
                     commands: [
